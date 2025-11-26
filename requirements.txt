@@ -1,0 +1,18 @@
+# Core
+numpy>=1.24
+python-dotenv>=1.0
+
+# FAISS (CPU)
+faiss-cpu>=1.8
+
+# PDF parsing
+pdfplumber>=0.11
+
+# Embeddings + LLM
+google-generativeai>=0.6
+
+# Streamlit app
+streamlit>=1.36
+
+# Optional splitters (fallback exists if missing)
+langchain-text-splitters>=0.2
