@@ -1,0 +1,36 @@
+# Python venvs
+venv/
+.venv/
+env/
+
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment & secrets
+.env
+.env.*
+
+# Logs
+*.log
+
+# Streamlit
+.streamlit/
+
+# FAISS shard indexes and metadata (generated)
+faiss_shards/
+faiss_shards_sc/
+faiss_shards_hc/
+faiss_shards_other/
+*.index
+metadata.db
+processed.json
+
+# Large local dataset (not committed)
+supreme-court-pdfs-05-06/
+
+# Misc OS/editor files
+.DS_Store
+Thumbs.db
