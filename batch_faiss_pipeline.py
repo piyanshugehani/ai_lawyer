@@ -186,7 +186,14 @@ def extract_metadata_from_filename(filename: str) -> Dict[str, Any]:
     year_match = re.search(r"(19|20)\d{2}", base)
     year = int(year_match.group(0)) if year_match else None
     court_match = re.search(r"\b(SC|HC|HighCourt|Supreme|District)\b", base, re.I)
-    court = court_match.group(0).upper() if court_match else None
+    court_raw = court_match.group(0).upper() if court_match else None
+    # Normalize to canonical short codes used for index routing
+    if court_raw in {"SC", "SUPREME"}:
+        court = "SC"
+    elif court_raw in {"HC", "HIGHCOURT"}:
+        court = "HC"
+    else:
+        court = court_raw
     return {"doc_id": base, "year": year, "court": court}
 
 
@@ -580,9 +587,9 @@ def process_pdf_batch(pdf_paths: List[Path], shard_mgr: FaissShardManager, manag
         ids = active_mgr.next_vector_id(len(batch_texts))
         # Optionally force a new shard per mini-batch
         if FORCE_NEW_SHARD:
-            next_num = max(shard_mgr.shards.keys()) + 1 if shard_mgr.shards else 0
-            LOG.info(f"FORCE_NEW_SHARD is ON — creating shard {next_num} for this batch")
-            shard_mgr._create_shard_file(next_num)
+            next_num = (max(active_mgr.shards.keys()) + 1) if active_mgr.shards else 0
+            LOG.info(f"FORCE_NEW_SHARD is ON — creating shard {next_num} for this batch (manager={active_mgr.out_dir.name})")
+            active_mgr._create_shard_file(next_num)
             shard_num = active_mgr.add_vectors(vectors, ids, shard_num=next_num)
         else:
             shard_num = active_mgr.add_vectors(vectors, ids)
