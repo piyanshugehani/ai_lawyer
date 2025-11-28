@@ -91,7 +91,7 @@ def _get_gemini_api_key() -> Optional[str]:
         return None
 
 def _get_gemini_model_name() -> str:
-    return os.getenv("GEMINI_GEN_MODEL", "gemini-1.5-flash")
+    return os.getenv("GEMINI_GEN_MODEL", "gemini-2.5-flash")
 
 def _is_trivial_query(text: str) -> bool:
     t = text.strip().lower()
