@@ -167,12 +167,8 @@ Planned improvements and experiments:
 - AI-powered case outcome prediction (research-only; include strong ethical guardrails)
 
 ## Ethical & Legal Disclaimer
-- iLegalLearn is an educational and research tool. It is NOT a replacement for a licensed lawyer.
 - Outputs may contain errors, omissions, or hallucinations. Always verify legal conclusions against primary sources and consult a qualified lawyer for legal advice.
 - Do not rely on this tool for time-sensitive or critical legal decisions.
-
-## Contributing
-This project is open-source-friendly. Contributions are welcome.
 
 Guidelines:
 - Fork the repository and open a branch for your work.
