@@ -30,6 +30,7 @@ processed.json
 
 # Large local dataset (not committed)
 supreme-court-pdfs-05-06/
+high-court-pdfs-05-06/
 
 # Misc OS/editor files
 .DS_Store

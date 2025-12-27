@@ -29,7 +29,7 @@ def _detect_intent(text: str, role: Optional[str]) -> Tuple[str, float]:
     ]
     # Professional intents
     patterns_prof = [
-        ("draft_notice", r"\b(draft|prepare|compose).{0,20}\b(notice|legal\s*notice)\b", 0.9),
+        ("draft_notice", r"\b(draft|prepare|compose|create|write|make).{0,30}\b(notice|affidavit|agreement|contract|deed|will|application|petition|plaint|reply|statement|memo|opinion|lease|rent)\b", 0.9),
         ("find_judgements", r"\b(find|search|relevant|latest).{0,20}\b(judg(e)?ment|precedent|case\s*law|authorities)\b", 0.85),
         ("citation_finder", r"\b(citation|cite|reported\s*as|AIR|SCC|SCR|Cri\s*LJ)\b", 0.85),
         ("case_tracking", r"\b(track|tracking|status|next\s*hearing|hearing\s*date|case\s*status)\b", 0.8),
@@ -171,4 +171,117 @@ def analyze_query(text: str, role: Optional[str] = None) -> Dict:
         "intent_confidence": round(float(ic), 2),
         "topic_confidence": round(float(tc), 2),
         "context_completeness": round(float(completeness), 2),
+    }
+
+
+def parse_case_identity(text: str) -> Dict[str, Optional[str]]:
+    """Strict extraction of case identity from user query.
+
+    Only extracts fields when they appear *explicitly* in the text. No inference.
+
+    Extracted fields (when present):
+    - case_type:       e.g. "Criminal Revision Application"
+    - case_number:     e.g. "2"
+    - filing_year:     e.g. "2002" (for patterns like "No. 2 of 2002")
+    - decision_date:   e.g. "1 July 2005" or "01/07/2005" (as string)
+    - decision_year:   e.g. "2005" (from the decision_date)
+    - court_name:      e.g. "Bombay High Court"
+    - court_level:     "High Court" or "Supreme Court" if explicitly mentioned
+
+    Also returns:
+    - raw_string: the exact "<TYPE> No. X of YYYY" phrase if matched
+    """
+
+    t = text
+    tl = text.lower()
+
+    # 1. Court level / name (only from explicit court phrases)
+    court_level: Optional[str] = None
+    court_name: Optional[str] = None
+
+    if "supreme court" in tl:
+        court_level = "Supreme Court"
+        court_name = "Supreme Court of India"
+    elif "high court" in tl:
+        court_level = "High Court"
+
+        # Try common High Court header forms, e.g.
+        # "HIGH COURT OF JUDICATURE AT BOMBAY" or "HIGH COURT AT BOMBAY"
+        m = re.search(r"high court(?: of judicature)? at ([A-Za-z ]+)", tl, re.IGNORECASE)
+        if m:
+            place = m.group(1).strip().title()
+            court_name = f"{place} High Court"
+
+        # Fallback: "Bombay High Court" style, but only a single-word place
+        # to avoid capturing full phrases like "dismissed for default by the Bombay".
+        if not court_name:
+            m2 = re.search(r"\b([A-Za-z]+)\s+high court\b", tl, re.IGNORECASE)
+            if m2:
+                place = m2.group(1).strip().title()
+                court_name = f"{place} High Court"
+
+    # 2. Case type / number / filing year patterns (no inference)
+    raw_string: Optional[str] = None
+    case_type: Optional[str] = None
+    case_number: Optional[str] = None
+    filing_year: Optional[str] = None
+
+    # Strict HC-style pattern: "Criminal Revision Application No. 2 of 2002", etc.
+    # Only allow known case-type tokens to avoid grabbing free text like "Why was ...".
+    case_type_pattern = (
+        r"Criminal\s+Revision\s+Application|"
+        r"Civil\s+Revision\s+Application|"
+        r"Criminal\s+Application|"
+        r"Civil\s+Application|"
+        r"Writ\s+Petition|"
+        r"Criminal\s+Appeal|"
+        r"Civil\s+Appeal"
+    )
+
+    patterns = [
+        rf"(?P<case_type>{case_type_pattern})\s+No\.?\s*(?P<case_number>\d+)\s+of\s+(?P<filing_year>\d{{4}})",
+        rf"(?P<case_type>{case_type_pattern})\s+No\.?\s*(?P<case_number>\d+)\s*/\s*(?P<filing_year>\d{{4}})",
+        r"case\s+no\.?\s*(?P<case_number>\d+)[/\s]*(?P<filing_year>\d{4})",
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, t, re.IGNORECASE)
+        if m:
+            raw_string = m.group(0).strip()
+            case_number = m.groupdict().get("case_number")
+            fy = m.groupdict().get("filing_year")
+            filing_year = fy if fy else None
+
+            ct = m.groupdict().get("case_type")
+            if ct:
+                case_type = " ".join(ct.split()).strip()
+            break
+
+    # 3. Decision date / year (explicit only, no inference)
+    decision_date: Optional[str] = None
+    decision_year: Optional[str] = None
+
+    # Pattern: "on 1 July 2005"
+    m_date1 = re.search(r"\bon\s+(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})", t, re.IGNORECASE)
+    if m_date1:
+        decision_date = m_date1.group(0).strip()
+        decision_year = m_date1.group(3)
+    else:
+        # Pattern: "dated 01.07.2005" or "dated 01/07/2005"
+        m_date2 = re.search(r"\bdated\s+(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})", t, re.IGNORECASE)
+        if m_date2:
+            decision_date = m_date2.group(0).strip()
+            y = m_date2.group(3)
+            # Normalize 2-digit year approximately to 4-digit when obvious (e.g. '05' -> '2005')
+            decision_year = y if len(y) == 4 else None
+
+    return {
+        "court_name": court_name,
+        "court_level": court_level,
+        "case_type": case_type,
+        "case_number": case_number,
+        "filing_year": filing_year,
+        "decision_date": decision_date,
+        "decision_year": decision_year,
+        "raw_string": raw_string,
     }

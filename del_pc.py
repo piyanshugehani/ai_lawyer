@@ -10,7 +10,7 @@ try:
 except Exception:
     pass
 
-INDEX_NAME = "legal-judgments-index"
+INDEX_NAME = "high-court-judgments-index"
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(INDEX_NAME)
