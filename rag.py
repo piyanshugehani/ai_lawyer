@@ -6,7 +6,7 @@ from pathlib import Path
 
 # External Libraries
 from pinecone import Pinecone
-from google import genai
+import requests
 
 # Load environment variables
 try:
@@ -48,27 +48,52 @@ except Exception as e:
     logger.warning(f"Bare Acts index initialisation failed: {e}")
     index_bare = None
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-
 # ---------------------------------------------------------
 # HELPER FUNCTIONS
 # ---------------------------------------------------------
 
 def get_query_embedding(text: str) -> Optional[List[float]]:
     """
-    Generates an embedding for the query using Gemini.
+    Generates an embedding for the query using the current 'gemini-embedding-001' model.
+    CRITICAL: We force 'outputDimensionality': 768 to match Pinecone's free tier index.
     """
     try:
-        resp = client.models.embed_content(
-            model="text-embedding-004",
-            contents=text,
-            config={"task_type": "RETRIEVAL_QUERY"}
+        # URL for the new stable model (v1beta is required for this model as of 2026)
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/"
+            "models/gemini-embedding-001:embedContent"
         )
-        if hasattr(resp, 'embeddings') and len(resp.embeddings) > 0:
-            return resp.embeddings[0].values
+
+        payload = {
+            "model": "models/gemini-embedding-001",
+            "content": {
+                "parts": [{"text": text}]
+            },
+            # FORCE 768 DIMENSIONS (Default is 3072, which breaks Pinecone free tier)
+            "outputDimensionality": 768
+        }
+
+        params = {"key": GEMINI_API_KEY}
+        
+        resp = requests.post(url, params=params, json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Parse the response
+        embedding = data.get("embedding") or {}
+        values = embedding.get("values")
+        
+        if values:
+            return values
+        else:
+            logger.error(f"No values found in response: {data}")
+            return None
+
     except Exception as e:
         logger.error(f"Failed to generate embedding: {e}")
-    return None
+        if 'resp' in locals():
+            logger.error(f"Response content: {resp.text}")
+        return None
 
 def build_pinecone_filter(
     court: Optional[str] = None, 
@@ -77,17 +102,11 @@ def build_pinecone_filter(
     doc_id_like: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Constructs the Pinecone metadata filter based on common fields:
-    - year (int)
-    - filename (str)
-
-    NOTE: Court/SCC/HCC routing is handled at the index level, not via metadata
-    filters, because Supreme Court and High Court are stored in separate
-    Pinecone indexes.
+    Constructs the Pinecone metadata filter.
     """
     filters = {}
 
-    # 1. Filter by Year -> Maps to 'year' field (common to both indexes)
+    # 1. Filter by Year
     if year_min is not None or year_max is not None:
         filters["year"] = {}
         if year_min is not None:
@@ -95,9 +114,8 @@ def build_pinecone_filter(
         if year_max is not None:
             filters["year"]["$lte"] = int(year_max)
 
-    # 2. Filter by Filename -> Maps to 'filename' field
+    # 2. Filter by Filename
     if doc_id_like:
-        # Exact match required for basic Pinecone metadata
         filters["filename"] = doc_id_like
 
     return filters
@@ -108,18 +126,7 @@ def build_bare_acts_filter(
     act_title_like: Optional[str] = None,
     section_number_like: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Constructs a simple metadata filter for the Bare Acts index.
-
-    All fields are optional and match the metadata schema you described:
-    - act_id (e.g. "ACT NO. 4 OF 1975")
-    - act_title (e.g. "THE TOBACCO BOARD ACT, 1975")
-    - section_number (e.g. "definitions", "5", "5A")
-
-    For now we use exact-equality filters, which work well when the
-    query is pre-parsed into these fields. The main entrypoint from the
-    app uses purely semantic search, so this filter is currently unused
-    but kept ready for future refinement.
-    """
+    """Constructs filter for Bare Acts index."""
     filt: Dict[str, Any] = {}
     if act_id_like:
         filt["act_id"] = act_id_like
@@ -144,56 +151,52 @@ def search_chunks(
     prefer_high_court: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Retrieves relevant chunks using your specific Metadata structure.
+    Retrieves relevant chunks using semantic search + metadata filtering.
     """
     
     # 1. Generate Vector
     vector = get_query_embedding(query)
     if not vector:
+        logger.error("Could not generate embedding for query.")
         return []
 
-    # 2. Build Filter (shared across indexes)
+    # 2. Build Filter
     meta_filter = build_pinecone_filter(court, year_min, year_max, doc_id_like)
 
-    # 3. Decide which indexes to query based on `court`
+    # 3. Decide which indexes to query
     court_norm = (court or "").lower().strip()
-
-    # Default behaviour: Supreme Court only
     indexes_to_query: List[Tuple[str, Any]]
+    
     if court_norm in ["hc", "hcc", "high", "high court"]:
         indexes_to_query = [("hcc", index_hc)]
     elif court_norm in ["both", "all"]:
         indexes_to_query = [("scc", index_sc), ("hcc", index_hc)]
     else:
-        # Includes "sc", "scc", "supreme", "supreme court", or empty
+        # Default to Supreme Court
         indexes_to_query = [("scc", index_sc)]
 
-    # 4. Query Pinecone for each selected index
-    # Fetch extra if we plan to do keyword filtering to ensure we return enough results
+    # 4. Query Pinecone
     fetch_k = top_k * 3 if keyword_must_contain else top_k
-
-    all_matches: List[Tuple[str, Any]] = []  # (label, match)
+    all_matches: List[Tuple[str, Any]] = []
 
     for label, idx in indexes_to_query:
         try:
             results = idx.query(
                 vector=vector,
                 top_k=fetch_k,
-                include_metadata=True,  # Critical: We need your 'text' field
+                include_metadata=True,
                 filter=meta_filter if meta_filter else None,
             )
+            for match in results.matches:
+                all_matches.append((label, match))
         except Exception as e:
             logger.error(f"Pinecone query failed for index '{label}': {e}")
             continue
 
-        for match in results.matches:
-            all_matches.append((label, match))
-
     if not all_matches:
         return []
 
-    # 5. Sort all matches by score (descending), with optional minor boost
-    # for High Court chunks when explicitly preferred (procedural queries).
+    # 5. Sort matches
     def _score_with_boost(label: str, base_score: float) -> float:
         if prefer_high_court and label == "hcc":
             return base_score + 0.05
@@ -201,44 +204,32 @@ def search_chunks(
 
     all_matches.sort(key=lambda x: _score_with_boost(x[0], x[1].score), reverse=True)
 
-    # 6. Parse Results based on your Metadata Structure
+    # 6. Parse Results
     enriched_results: List[Dict[str, Any]] = []
 
     for label, match in all_matches:
         md = match.metadata or {}
-
-        # --- MAPPING YOUR SPECIFIC FIELDS ---
-        text_content = md.get("text", "")            # Field: text
-        filename = md.get("filename", "Unknown")     # Field: filename
-        page = int(md.get("page", 0))                # Field: page
-        year = int(md.get("year", 0))                # Field: year
-        # Prefer explicit category, then court_level, finally index label
-        court_level_md = md.get("court_level")
-        category = md.get("category") or court_level_md or label
-        court_name_md = md.get("court")
-        chunk_idx = int(md.get("chunk_index", 0))    # Field: chunk_index
-        # ------------------------------------
-
-        # Keyword Enforcement (Post-Retrieval Filter)
+        text_content = md.get("text", "")
+        
+        # Keyword check
         if keyword_must_contain and keyword_must_contain.lower() not in text_content.lower():
             continue
 
         enriched_results.append({
-            "doc_id": filename,
-            "source_path": filename,
-            "chunk_index": chunk_idx,
+            "doc_id": md.get("filename", "Unknown"),
+            "source_path": md.get("filename", "Unknown"),
+            "chunk_index": int(md.get("chunk_index", 0)),
             "score": match.score,
-            "title": f"{filename} (Page {page})",
-            "year": year,
-            "category": category,
-            "court": court_name_md,
-            "court_level": court_level_md,
-            "page": page,
-            "summary": text_content,  # Used by downstream LLM
-            "text": text_content,     # Raw text access
+            "title": f"{md.get('filename')} (Page {md.get('page')})",
+            "year": int(md.get("year", 0)),
+            "category": md.get("category") or label,
+            "court": md.get("court"),
+            "court_level": md.get("court_level"),
+            "page": int(md.get("page", 0)),
+            "summary": text_content,
+            "text": text_content,
         })
 
-    # Return top_k combined across indexes
     return enriched_results[:top_k]
 
 
@@ -249,21 +240,9 @@ def search_bare_acts(
     act_title_like: Optional[str] = None,
     section_number_like: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Semantic search over the Bare Acts index.
-
-    Metadata schema (per your description):
-    - act_id:          "ACT NO. 4 OF 1975"
-    - act_title:       "THE TOBACCO BOARD ACT, 1975"
-    - doc_type:        e.g. "bare_act_definition"
-    - enactment_year:  1975
-    - jurisdiction:    "India"
-    - section_number:  e.g. "definitions", "5", "5A"
-    - source:          "legislative_text"
-    - text:            full statutory / preamble text
-    """
+    """Semantic search over the Bare Acts index."""
 
     if index_bare is None:
-        # Bare Acts index not configured; fail soft.
         return []
 
     vector = get_query_embedding(query)
@@ -291,40 +270,21 @@ def search_bare_acts(
 
     for match in results.matches:
         md = match.metadata or {}
-
         text_content = md.get("text", "")
-        act_id = md.get("act_id") or "Unknown Act ID"
-        act_title = md.get("act_title") or "Bare Act Provision"
-        section_number = md.get("section_number") or ""
-        enactment_year_raw = md.get("enactment_year")
-        try:
-            enactment_year = int(enactment_year_raw) if enactment_year_raw is not None else 0
-        except (TypeError, ValueError):
-            enactment_year = 0
-
-        doc_type = md.get("doc_type") or "bare_act"
-        jurisdiction = md.get("jurisdiction") or "India"
-
-        title_suffix = f" - Section {section_number}" if section_number else ""
-
+        
         enriched.append({
-            "doc_id": act_id,
-            "source_path": act_title,
+            "doc_id": md.get("act_id", "Unknown Act ID"),
+            "source_path": md.get("act_title", "Bare Act"),
             "chunk_index": int(md.get("chunk_index", 0)),
             "score": match.score,
-            "title": f"{act_title}{title_suffix}",
-            "year": enactment_year,
-            "category": doc_type,
-            "court": jurisdiction,
+            "title": md.get("act_title", "Act"),
+            "year": int(md.get("enactment_year", 0)),
+            "category": md.get("doc_type", "bare_act"),
+            "court": md.get("jurisdiction", "India"),
             "court_level": "Bare Act",
             "page": 0,
             "summary": text_content,
             "text": text_content,
-            "act_id": act_id,
-            "act_title": act_title,
-            "section_number": section_number,
-            "doc_type": doc_type,
-            "jurisdiction": jurisdiction,
         })
 
     return enriched
@@ -337,14 +297,18 @@ def retrieve(query: str, k: int = 3) -> List[Dict[str, Any]]:
 # TEST
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    # Test based on your specific sample data
-    print("--- Testing Retrieval with your Metadata ---")
+    print("--- Testing Retrieval with gemini-embedding-001 (768 dim) ---")
     
-    # 1. Try to find the exact chunk you showed me (Toy vs Exercise equipment)
-    print("\nSearch: 'swings slides fun fliers'")
-    results = search_chunks("swings slides fun fliers physical exercise", top_k=3)
+    test_query = "swings slides fun fliers physical exercise"
+    print(f"\nSearch: '{test_query}'")
+    results = search_chunks(test_query, top_k=3)
+    
+    if not results:
+        print("No results found. NOTE: If you just switched models, you MUST re-ingest your documents.")
+        print("The old vectors (from text-embedding-004) are incompatible with the new model.")
     
     for r in results:
+        print("-" * 40)
         print(f"Found: {r['doc_id']}")
-        print(f"Page: {r['page']} | Year: {r['year']} | Cat: {r['category']}")
-        print(f"Snippet: {r['text'][:100]}...")
+        print(f"Page: {r['page']} | Year: {r['year']} | Score: {r['score']:.4f}")
+        print(f"Snippet: {r['text'][:150]}...")

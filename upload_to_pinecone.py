@@ -137,7 +137,7 @@ def generate_embedding(text: str, retry_count=0):
     """IO-bound task: Calls Gemini API with exponential backoff."""
     try:
         resp = client.models.embed_content(
-            model="text-embedding-004",
+            model="models/gemini-embedding-001",
             contents=text,
             config={"task_type": "RETRIEVAL_DOCUMENT"}
         )
