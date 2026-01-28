@@ -516,6 +516,11 @@ def render_arguments_panel():
                 # Judge stops flow. AI Lawyer does NOT speak.
                 st.session_state["clarification_count"] = st.session_state.get("clarification_count", 0) + 1
                 _append_turn("judge", "The Court", judge_msg)
+                # Move into Evidence phase so that the NEXT user submission
+                # is treated as the single evidentiary item.
+                current_phase = st.session_state.get("court_phase", "Opening")
+                if current_phase == "Opening":
+                    st.session_state["court_phase"] = "Evidence"
                 st.rerun()
                 return
 
@@ -539,24 +544,32 @@ def render_arguments_panel():
                 if judge_msg:
                     _append_turn("judge", "The Court", judge_msg)
                 
-                # 3A. Phase transition logic aligned with Supreme Court Simulation flow
-                # Opening -> Evidence -> Rebuttal; Decision is triggered via JUDGMENT branch
-                # or via the automatic Rebuttal+Decision handler above.
+                # 3A. Phase-aware flow control
+                # Opening -> Evidence -> Rebuttal -> Decision
                 current_phase = st.session_state.get("court_phase", "Opening")
 
-                # 4. AI LAWYER RESPONDS
-                with st.spinner(f"Counsel for {cfg['opp_label']} is responding..."):
-                    reply = _generate_opposing_counsel_reply(user_input, cfg)
-                    _append_turn("ai_counsel", f"AI Lawyer ({cfg['opp_label']})", reply)
-
-                # After both sides have opened at least once, move from Opening to Evidence.
-                stats = _compute_argument_stats(cfg)
                 if current_phase == "Opening":
+                    # In Opening, the Opposing Counsel responds once per turn.
+                    with st.spinner(f"Counsel for {cfg['opp_label']} is responding..."):
+                        reply = _generate_opposing_counsel_reply(user_input, cfg)
+                        _append_turn("ai_counsel", f"AI Lawyer ({cfg['opp_label']})", reply)
+
+                    # After both sides have opened at least once, move from Opening to Evidence.
+                    stats = _compute_argument_stats(cfg)
                     if stats["openings"]["user"] >= 1 and stats["openings"]["opp"] >= 1:
                         st.session_state["court_phase"] = "Evidence"
+
                 elif current_phase == "Evidence":
-                    # Mark that the user's single evidentiary submission has been used
-                    st.session_state["user_evidence_submitted"] = True
-                    # After the evidence round, proceed to Rebuttal, which is handled automatically
-                    st.session_state["court_phase"] = "Rebuttal"
+                    # Treat this submission as the single evidentiary item allowed.
+                    # No AI Lawyer response in Evidence phase.
+                    if st.session_state.get("user_evidence_submitted", False):
+                        # Defensive guard: ignore any further evidence attempts.
+                        st.session_state["court_phase"] = "Rebuttal"
+                    else:
+                        st.session_state["user_evidence_submitted"] = True
+                        # Move directly to Rebuttal; automatic handler will
+                        # generate the single AI rebuttal and final order.
+                        st.session_state["court_phase"] = "Rebuttal"
+
+                # Rebuttal and Decision phases never expect fresh user input.
                 st.rerun()

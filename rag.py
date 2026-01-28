@@ -21,9 +21,10 @@ except Exception:
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-# Separate indexes for Supreme Court (SCC) and High Court (HCC)
+# Separate indexes for Supreme Court (SCC), High Court (HCC) and Bare Acts
 INDEX_NAME_SC = "legal-judgments-index"
 INDEX_NAME_HC = "high-court-judgments-index"
+INDEX_NAME_BARE = os.getenv("BARE_ACTS_INDEX_NAME", "legal-bare-acts-index")
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -37,9 +38,15 @@ if not PINECONE_API_KEY or not GEMINI_API_KEY:
 # ---------------------------------------------------------
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
-# Individual indexes for SCC and HCC
+# Individual indexes for SCC, HCC and Bare Acts
 index_sc = pc.Index(INDEX_NAME_SC)
 index_hc = pc.Index(INDEX_NAME_HC)
+try:
+    index_bare = pc.Index(INDEX_NAME_BARE)
+except Exception as e:
+    # Bare Acts index is optional; log and continue gracefully if missing
+    logger.warning(f"Bare Acts index initialisation failed: {e}")
+    index_bare = None
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -94,6 +101,33 @@ def build_pinecone_filter(
         filters["filename"] = doc_id_like
 
     return filters
+
+
+def build_bare_acts_filter(
+    act_id_like: Optional[str] = None,
+    act_title_like: Optional[str] = None,
+    section_number_like: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Constructs a simple metadata filter for the Bare Acts index.
+
+    All fields are optional and match the metadata schema you described:
+    - act_id (e.g. "ACT NO. 4 OF 1975")
+    - act_title (e.g. "THE TOBACCO BOARD ACT, 1975")
+    - section_number (e.g. "definitions", "5", "5A")
+
+    For now we use exact-equality filters, which work well when the
+    query is pre-parsed into these fields. The main entrypoint from the
+    app uses purely semantic search, so this filter is currently unused
+    but kept ready for future refinement.
+    """
+    filt: Dict[str, Any] = {}
+    if act_id_like:
+        filt["act_id"] = act_id_like
+    if act_title_like:
+        filt["act_title"] = act_title_like
+    if section_number_like:
+        filt["section_number"] = section_number_like
+    return filt
 
 # ---------------------------------------------------------
 # MAIN SEARCH FUNCTION
@@ -206,6 +240,94 @@ def search_chunks(
 
     # Return top_k combined across indexes
     return enriched_results[:top_k]
+
+
+def search_bare_acts(
+    query: str,
+    top_k: int = 5,
+    act_id_like: Optional[str] = None,
+    act_title_like: Optional[str] = None,
+    section_number_like: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Semantic search over the Bare Acts index.
+
+    Metadata schema (per your description):
+    - act_id:          "ACT NO. 4 OF 1975"
+    - act_title:       "THE TOBACCO BOARD ACT, 1975"
+    - doc_type:        e.g. "bare_act_definition"
+    - enactment_year:  1975
+    - jurisdiction:    "India"
+    - section_number:  e.g. "definitions", "5", "5A"
+    - source:          "legislative_text"
+    - text:            full statutory / preamble text
+    """
+
+    if index_bare is None:
+        # Bare Acts index not configured; fail soft.
+        return []
+
+    vector = get_query_embedding(query)
+    if not vector:
+        return []
+
+    meta_filter = build_bare_acts_filter(
+        act_id_like=act_id_like,
+        act_title_like=act_title_like,
+        section_number_like=section_number_like,
+    )
+
+    try:
+        results = index_bare.query(
+            vector=vector,
+            top_k=top_k,
+            include_metadata=True,
+            filter=meta_filter or None,
+        )
+    except Exception as e:
+        logger.error(f"Pinecone query failed for Bare Acts index: {e}")
+        return []
+
+    enriched: List[Dict[str, Any]] = []
+
+    for match in results.matches:
+        md = match.metadata or {}
+
+        text_content = md.get("text", "")
+        act_id = md.get("act_id") or "Unknown Act ID"
+        act_title = md.get("act_title") or "Bare Act Provision"
+        section_number = md.get("section_number") or ""
+        enactment_year_raw = md.get("enactment_year")
+        try:
+            enactment_year = int(enactment_year_raw) if enactment_year_raw is not None else 0
+        except (TypeError, ValueError):
+            enactment_year = 0
+
+        doc_type = md.get("doc_type") or "bare_act"
+        jurisdiction = md.get("jurisdiction") or "India"
+
+        title_suffix = f" - Section {section_number}" if section_number else ""
+
+        enriched.append({
+            "doc_id": act_id,
+            "source_path": act_title,
+            "chunk_index": int(md.get("chunk_index", 0)),
+            "score": match.score,
+            "title": f"{act_title}{title_suffix}",
+            "year": enactment_year,
+            "category": doc_type,
+            "court": jurisdiction,
+            "court_level": "Bare Act",
+            "page": 0,
+            "summary": text_content,
+            "text": text_content,
+            "act_id": act_id,
+            "act_title": act_title,
+            "section_number": section_number,
+            "doc_type": doc_type,
+            "jurisdiction": jurisdiction,
+        })
+
+    return enriched
 
 def retrieve(query: str, k: int = 3) -> List[Dict[str, Any]]:
     """Legacy wrapper."""

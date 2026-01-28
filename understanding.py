@@ -35,6 +35,13 @@ def _detect_intent(text: str, role: Optional[str]) -> Tuple[str, float]:
         ("case_tracking", r"\b(track|tracking|status|next\s*hearing|hearing\s*date|case\s*status)\b", 0.8),
     ]
     generic_patterns = [
+        # Queries asking about the objective/purpose/scope of a named Act
+        # (e.g. "What is the objective of the Railway Property (Unlawful Possession) Act, 1966?")
+        (
+            "simplify_section",
+            r"\b(objective|object|purpose|scope|aim)\b.{0,80}\b[ a-z()/-]+ act,?\s*(19|20)\d{2}\b",
+            0.85,
+        ),
         ("simplify_section", r"\b(section\s*\d+|ipc|crpc|evidence\s*act|contract\s*act|it\s*act|constitution\s*article)\b", 0.7),
         ("find_judgements", r"\b(case|judg(e)?ment|precedent|authority|ruling|decision)\b", 0.6),
     ]

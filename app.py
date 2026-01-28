@@ -592,6 +592,7 @@ def main():
         # We simply let the retriever rank by semantic similarity.
         prefer_high_court = False
 
+        # 1) Case-law retrieval (Supreme Court / High Court)
         retrieved_docs = rag.search_chunks(
             query=user_input,
             top_k=5,
@@ -600,6 +601,35 @@ def main():
             year_max=year_max,
             prefer_high_court=prefer_high_court,
         )
+
+        # 2) Bare Acts retrieval – triggered when the query looks statute-heavy
+        #    (e.g. "explain section 5 of the Limitation Act" or objective of a
+        #    specific Act) or when the explicit intent is to simplify a section.
+        need_bare_acts = False
+        if analysis.get("intent") == "simplify_section":
+            need_bare_acts = True
+        else:
+            statute_pattern = re.compile(
+                r"(section\s*\d+[a-zA-Z]*|article\s*\d+[a-zA-Z]*|\bipc\b|\bi\.p\.c\b|\bcrpc\b|\bc\.r\.p\.c\b|evidence act|contract act|limitation act|bare act|[\w\s()/-]+ act,?\s*(19|20)\d{2})",
+                re.IGNORECASE,
+            )
+            if statute_pattern.search(user_input):
+                need_bare_acts = True
+
+        # If no case-law context was found at all, fall back to Bare Acts
+        # to still provide grounded statutory explanations where possible.
+        if not retrieved_docs:
+            need_bare_acts = True
+
+        bare_act_docs: List[Dict[str, Any]] = []
+        if need_bare_acts:
+            bare_act_docs = rag.search_bare_acts(
+                query=user_input,
+                top_k=3,
+            )
+            if bare_act_docs:
+                log_cli("📚 Bare Acts", f"Retrieved {len(bare_act_docs)} bare act chunks.")
+                retrieved_docs = (retrieved_docs or []) + bare_act_docs
 
         # --- CLI transparency: log filters and retrieved docs ---
         log_cli(
@@ -618,11 +648,19 @@ def main():
                 )
         # --- Guardrail: corpus-limited disclaimer when weak/no context ---
         disclaimer = None
+        # Detect whether we have any Bare Act context in the retrieved set.
+        has_bare_acts = any(
+            (d.get("court_level") == "Bare Act")
+            or str(d.get("doc_type", "")).startswith("bare_act")
+            for d in (retrieved_docs or [])
+        )
+
         # For precise identity queries (explicit case_number + filing_year),
         # skip generic corpus-year warnings to avoid confusing filing vs
-        # decision years.
+        # decision years. Also skip such warnings when Bare Acts are present,
+        # because bare-acts corpus is not limited to 2005–2006.
         is_identity_query = bool(case_identity.get("case_number") and case_identity.get("filing_year"))
-        if not is_identity_query:
+        if not is_identity_query and not has_bare_acts:
             # Known corpus window based on your ingestion of PDFs
             corpus_min, corpus_max = 2005, 2006
             query_year = year_min
@@ -636,8 +674,8 @@ def main():
             elif query_year and (query_year < corpus_min or query_year > corpus_max):
                 disclaimer = (
                     "⚠️ Your query mentions a year that may fall outside the primary "
-                    "coverage of the current corpus. Results may be incomplete; "
-                    "consider specifying cases or years known to be within the corpus."
+                    "coverage of the current judgments corpus (2005–2006). Bare Acts "
+                    "may still be available, but case-law results could be incomplete."
                 )
 
         # --- Identity check: if user specified a case identity, ensure retrieved
