@@ -30,7 +30,7 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
 # Env Variables / Config
 INDEX_NAME = "legal-judgments-index" # Using the same index, but different Namespace
-NAMESPACE = "high_court"             # Separate Namespace for HC
+NAMESPACE = "HC"             # Separate Namespace for HC
 RESET_MODE = os.getenv("RESET", "0") == "1"
 CPU_WORKERS = int(os.getenv("EMBED_WORKERS", "4"))
 
