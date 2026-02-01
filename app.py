@@ -252,11 +252,12 @@ def _generate_answer(query: str, role: str, intent: str, retrieved_docs: List[Di
         return cautious
 
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(_get_gemini_model_name())
-        resp = model.generate_content(prompt)
-        return resp.text
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        model_name = _get_gemini_model_name()
+        resp = client.models.generate_content(model=model_name, contents=prompt)
+        # New google-genai client returns a response object with 'text' attr
+        return getattr(resp, "text", str(resp))
     except Exception as e:
         return f"⚠️ Error: {e}"
 
@@ -344,11 +345,11 @@ This document is AI-generated and must be reviewed by a qualified legal professi
 """
 
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(_get_gemini_model_name())
-        resp = model.generate_content(prompt)
-        return resp.text
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        model_name = _get_gemini_model_name()
+        resp = client.models.generate_content(model=model_name, contents=prompt)
+        return getattr(resp, "text", str(resp))
     except Exception as e:
         return f"Error while generating draft: {e}"
 

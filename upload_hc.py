@@ -4,326 +4,271 @@ import logging
 import re
 import json
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from typing import List, Dict, Any, Tuple
 
-import pdfplumber
-from pinecone import Pinecone
-from google import genai
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from tqdm import tqdm
+# Third-party imports
+try:
+    import pdfplumber
+    from pinecone import Pinecone
+    from google import genai
+    from google.genai import types
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from tqdm import tqdm
+    from dotenv import load_dotenv
+except ImportError as e:
+    raise ImportError(f"Missing library: {e}. Run: pip install pdfplumber pinecone-client google-genai langchain-text-splitters tqdm python-dotenv")
 
 # ------------------------------
-# Environment & Config
+# 1. Configuration & Setup
 # ------------------------------
-try:
-    from dotenv import load_dotenv
-    load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
-except ImportError:
-    pass
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 # API Keys
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-if not GEMINI_API_KEY or not PINECONE_API_KEY:
-    raise RuntimeError("❌ Missing API keys in .env")
+# Env Variables / Config
+INDEX_NAME = "legal-judgments-index" # Using the same index, but different Namespace
+NAMESPACE = "high_court"             # Separate Namespace for HC
+RESET_MODE = os.getenv("RESET", "0") == "1"
+CPU_WORKERS = int(os.getenv("EMBED_WORKERS", "4"))
 
-# ------------------------------
-# Pinecone / Dataset Settings
-# ------------------------------
-INDEX_NAME = "high-court-judgments-index"
-DATA_DIR = Path(__file__).with_name("high-court-pdfs-05-06")
+DATA_DIR = Path(__file__).parent / "high-court-pdfs-05-06"
+PROCESSED_TRACKER_FILE = Path(__file__).parent / "processed_hc.json"
 
-PROCESSED_TRACKER_FILE = "processed_hc.json"
-
-# ------------------------------
-# Performance Tuning
-# ------------------------------
-MAX_WORKERS_PDF = 4
-MAX_WORKERS_EMBED = 8
+# Tuning
 PINECONE_BATCH_SIZE = 100
-
-CHUNK_SIZE = 600
+CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 100
+GEMINI_RPM_DELAY = 4.0 # 4s delay to stay safe
 
-# ------------------------------
-# Logging (HC-specific)
-# ------------------------------
+# Logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("execution_errors_hc.log"),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler("execution_hc.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
+if not PINECONE_API_KEY or not GEMINI_API_KEY:
+    raise RuntimeError("❌ Missing API Keys. Check your .env file.")
+
 # ------------------------------
-# Clients
+# 2. Domain Logic: High Court Mappings
+# ------------------------------
+HC_STATE_MAP = {
+    "Allahabad": "Uttar Pradesh", "Andhra Pradesh": "Andhra Pradesh", "Bombay": "Maharashtra",
+    "Calcutta": "West Bengal", "Chhattisgarh": "Chhattisgarh", "Delhi": "Delhi",
+    "Gauhati": "Assam", "Gujarat": "Gujarat", "Himachal Pradesh": "Himachal Pradesh",
+    "Jammu": "Jammu & Kashmir", "Kashmir": "Jammu & Kashmir", "Jharkhand": "Jharkhand",
+    "Karnataka": "Karnataka", "Kerala": "Kerala", "Madhya Pradesh": "Madhya Pradesh",
+    "Madras": "Tamil Nadu", "Manipur": "Manipur", "Meghalaya": "Meghalaya",
+    "Orissa": "Odisha", "Odisha": "Odisha", "Patna": "Bihar",
+    "Punjab": "Punjab & Haryana", "Haryana": "Punjab & Haryana", "Rajasthan": "Rajasthan",
+    "Sikkim": "Sikkim", "Telangana": "Telangana", "Tripura": "Tripura",
+    "Uttarakhand": "Uttarakhand"
+}
+
+# ------------------------------
+# 3. Initialize Clients
 # ------------------------------
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(INDEX_NAME)
 client = genai.Client(api_key=GEMINI_API_KEY)
-
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=CHUNK_OVERLAP
-)
+splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
 # ------------------------------
-# Processed Files Tracker
+# 4. Helper Functions
 # ------------------------------
 def get_processed_files() -> set:
-    if os.path.exists(PROCESSED_TRACKER_FILE):
+    if PROCESSED_TRACKER_FILE.exists() and not RESET_MODE:
         try:
             with open(PROCESSED_TRACKER_FILE, "r") as f:
                 return set(json.load(f))
-        except Exception as e:
-            logger.error(f"Failed reading processed_hc.json: {e}")
+        except:
+            return set()
     return set()
 
 def mark_files_as_processed(filenames: List[str]):
-    processed = get_processed_files()
-    processed.update(filenames)
-    try:
-        with open(PROCESSED_TRACKER_FILE, "w") as f:
-            json.dump(list(processed), f, indent=4)
-    except Exception as e:
-        logger.error(f"Failed updating processed_hc.json: {e}")
+    current = get_processed_files()
+    current.update(filenames)
+    with open(PROCESSED_TRACKER_FILE, "w") as f:
+        json.dump(list(current), f)
 
-# ------------------------------
-# Text Cleaning & Heuristics
-# ------------------------------
-HC_STATE_MAP = {
-    "Allahabad": "Uttar Pradesh",
-    "Andhra Pradesh": "Andhra Pradesh",
-    "Bombay": "Maharashtra",
-    "Calcutta": "West Bengal",
-    "Chhattisgarh": "Chhattisgarh",
-    "Delhi": "Delhi",
-    "Gauhati": "Assam",
-    "Gujarat": "Gujarat",
-    "Himachal Pradesh": "Himachal Pradesh",
-    "Jammu": "Jammu & Kashmir",
-    "Kashmir": "Jammu & Kashmir",
-    "Jharkhand": "Jharkhand",
-    "Karnataka": "Karnataka",
-    "Kerala": "Kerala",
-    "Madhya Pradesh": "Madhya Pradesh",
-    "Madras": "Tamil Nadu",
-    "Manipur": "Manipur",
-    "Meghalaya": "Meghalaya",
-    "Orissa": "Odisha",
-    "Odisha": "Odisha",
-    "Patna": "Bihar",
-    "Punjab": "Punjab & Haryana",
-    "Haryana": "Punjab & Haryana",
-    "Rajasthan": "Rajasthan",
-    "Sikkim": "Sikkim",
-    "Telangana": "Telangana",
-    "Tripura": "Tripura",
-    "Uttarakhand": "Uttarakhand"
-}
-
-def clean_text(text: str) -> str:
-    """
-    Cleans common OCR artifacts found in Indian High Court PDFs.
-    """
-    if not text:
-        return ""
-
-    # 1. Fix "Simulated Bold" artifacts (e.g., "IIINNN" -> "IN", "TTTHHHEEE" -> "THE")
-    # Matches any uppercase letter repeated 3 times or more
-    text = re.sub(r'([A-Z])\1\1+', r'\1', text)
-
-    # 2. Normalize whitespace (tabs/newlines -> single space)
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    return text
+def sanitize_id(text: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9_\-]', '_', text)
 
 def detect_court_metadata(text_sample: str, filename: str) -> Tuple[str, str]:
-    """
-    Returns (Court Name, State) based on text headers or filename using simple heuristics.
-    """
-    text_lower = text_sample.lower()[:2000] if text_sample else "" # Only scan header area
+    """Returns (Court Name, State) based on text headers or filename."""
+    text_lower = text_sample.lower()[:2000] if text_sample else ""
     filename_lower = filename.lower()
     
-    # Priority: Check explicit "High Court of [Place]" in text
     for key, state in HC_STATE_MAP.items():
         key_lower = key.lower()
-        
-        # Check 1: Text pattern
-        if f"high court of {key_lower}" in text_lower or f"{key_lower} high court" in text_lower:
-            return f"{key} High Court", state
-        
-        # Check 2: Filename pattern
-        if key_lower in filename_lower:
+        # Check Text or Filename
+        if f"high court of {key_lower}" in text_lower or f"{key_lower} high court" in text_lower or key_lower in filename_lower:
             return f"{key} High Court", state
 
     return "Unknown High Court", "Unknown"
 
 # ------------------------------
-# PDF → Chunk Extraction
+# 5. Core Logic
 # ------------------------------
+
 def extract_text_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
-    results = []
+    """
+    Parses PDF -> Fixes OCR Artifacts -> Detects Metadata -> Cleans -> Chunks.
+    """
     file_name = pdf_path.name
-
-    # Metadata placeholders
-    detected_court = "Unknown High Court"
-    detected_state = "Unknown"
-
+    results = []
+    
     try:
+        full_text = ""
+        # We need specific page 1 text for metadata detection
+        page_one_text = "" 
+
         with pdfplumber.open(pdf_path) as pdf:
-            # 1. First Pass: Detect Metadata from Page 1 (Header usually here)
-            if len(pdf.pages) > 0:
-                # IMPORTANT: Extract AND Clean before detection
-                # If we don't clean, "IIINNN TTTHHHEEE HIGH COURT" won't match our heuristics
-                raw_p1 = pdf.pages[0].extract_text()
-                cleaned_p1 = clean_text(raw_p1)
-                detected_court, detected_state = detect_court_metadata(cleaned_p1, file_name)
+            for i, page in enumerate(pdf.pages):
+                txt = page.extract_text()
+                if txt:
+                    if i == 0: page_one_text = txt
+                    full_text += txt + " "
 
-            # 2. Second Pass: Extract and Chunk all pages
-            for page_no, page in enumerate(pdf.pages, start=1):
-                raw_text = page.extract_text()
-                
-                # Apply Cleaning
-                text = clean_text(raw_text)
+        if not full_text.strip():
+            return []
 
-                if not text:
-                    continue
+        # --- STEP 1: Fix specific OCR artifacts (like "IIINNN" -> "IN") ---
+        # Matches uppercase letter repeated 3+ times
+        fixed_text = re.sub(r'([A-Z])\1\1+', r'\1', full_text)
+        
+        # --- STEP 2: Detect Metadata (using text with case preserved ideally, or lightly cleaned) ---
+        detected_court, detected_state = detect_court_metadata(fixed_text, file_name)
 
-                chunks = splitter.split_text(text)
+        # --- STEP 3: Final Cleaning (Lowercasing + Whitespace) ---
+        cleaned_text = re.sub(r'\s+', ' ', fixed_text).strip().lower()
 
-                match = re.search(r"(19|20)\d{2}", file_name)
-                year = int(match.group()) if match else 0
+        # Preview for debugging
+        if len(cleaned_text) > 0:
+            print(f"\n📄 [{detected_court}]: {cleaned_text[:200]}...\n")
 
-                for idx, chunk in enumerate(chunks):
-                    results.append({
-                        "id": f"hc_{file_name}_p{page_no}_c{idx}",
-                        "text": chunk,
-                        "metadata": {
-                            "court_level": "High Court",
-                            "court": detected_court,   # Heuristic applied
-                            "state": detected_state,   # Heuristic applied
-                            "year": year,
-                            "filename": file_name,
-                            "page": page_no,
-                            "chunk_index": idx,
-                            "source": "pdf",
-                            "text": chunk
-                        }
-                    })
+        # Split
+        chunks = splitter.split_text(cleaned_text)
+        
+        match = re.search(r'(19|20)\d{2}', file_name)
+        year = int(match.group(0)) if match else 0
 
+        for i, chunk in enumerate(chunks):
+            unique_id = f"hc_{sanitize_id(file_name)}_c{i}"
+            results.append({
+                "id": unique_id,
+                "text": chunk,
+                "namespace": NAMESPACE,
+                "metadata": {
+                    "filename": file_name,
+                    "year": year,
+                    "court": detected_court,
+                    "state": detected_state,
+                    "chunk_index": i,
+                    "text": chunk
+                }
+            })
     except Exception as e:
-        logger.error(f"❌ Failed parsing PDF {file_name}: {e}")
-
+        logger.warning(f"⚠️ Corrupt/Skipped: {file_name} ({e})")
+        return []
+        
     return results
 
-# ------------------------------
-# Embedding Generation
-# ------------------------------
-def generate_embedding(text: str, retry_count: int = 0):
-    try:
-        resp = client.models.embed_content(
-            model="text-embedding-004",
-            contents=text,
-            config={"task_type": "RETRIEVAL_DOCUMENT"}
-        )
-        if resp.embeddings:
-            return resp.embeddings[0].values
-
-    except Exception as e:
-        # Simple backoff for rate limits
-        if "429" in str(e) and retry_count < 5:
-            time.sleep((2 ** retry_count) + 1)
-            return generate_embedding(text, retry_count + 1)
-        logger.error(f"Embedding failed: {e}")
-
-    return None
-
-# ------------------------------
-# Embed + Upsert
-# ------------------------------
-def process_batch_embeddings_and_upsert(chunks: List[Dict[str, Any]]):
-    vectors = []
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_EMBED) as executor:
-        future_map = {
-            executor.submit(generate_embedding, c["text"]): c
-            for c in chunks
-        }
-
-        for future in as_completed(future_map):
-            chunk = future_map[future]
-            embedding = future.result()
-            if embedding:
-                vectors.append({
-                    "id": chunk["id"],
-                    "values": embedding,
-                    "metadata": chunk["metadata"]
-                })
-
-    if not vectors:
+def batch_embed_and_upload(chunk_buffer: List[Dict[str, Any]]):
+    """
+    Optimized: Batches texts -> One API Call -> Upsert.
+    """
+    if not chunk_buffer:
         return
 
-    # Batch upsert to Pinecone
-    for i in range(0, len(vectors), PINECONE_BATCH_SIZE):
+    # Process in batches of 100
+    for i in range(0, len(chunk_buffer), PINECONE_BATCH_SIZE):
+        batch = chunk_buffer[i : i + PINECONE_BATCH_SIZE]
+        texts = [x['text'] for x in batch]
+        
+        if not texts: continue
+
         try:
-            index.upsert(vectors=vectors[i:i + PINECONE_BATCH_SIZE])
+            # 1. Embed (Gemini)
+            response = client.models.embed_content(
+                model="models/text-embedding-004", 
+                contents=texts,
+                config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT")
+            )
+            
+            # 2. Map Responses
+            vectors = []
+            if hasattr(response, 'embeddings'):
+                for idx, embedding_obj in enumerate(response.embeddings):
+                    item = batch[idx]
+                    vectors.append({
+                        "id": item['id'],
+                        "values": embedding_obj.values,
+                        "metadata": item['metadata']
+                    })
+            
+            # 3. Upsert (Pinecone)
+            if vectors:
+                index.upsert(vectors=vectors, namespace=NAMESPACE)
+            
+            # 4. Safety Sleep
+            time.sleep(GEMINI_RPM_DELAY)
+            
         except Exception as e:
-            logger.error(f"Pinecone upsert failed: {e}")
+            if "429" in str(e):
+                logger.error("🛑 Rate Limit Hit (429). Sleeping 60s...")
+                time.sleep(60)
+            else:
+                logger.error(f"❌ Batch Error: {e}")
 
 # ------------------------------
-# Main Orchestration
+# 6. Main Orchestration
 # ------------------------------
 def main():
+    if RESET_MODE and PROCESSED_TRACKER_FILE.exists():
+        os.remove(PROCESSED_TRACKER_FILE)
+        logger.info("♻️  Reset mode: Tracker cleared.")
+
     if not DATA_DIR.exists():
-        logger.error(f"Directory not found: {DATA_DIR}")
+        logger.error(f"❌ Data directory not found: {DATA_DIR}")
         return
 
     all_pdfs = list(DATA_DIR.rglob("*.pdf"))
     processed = get_processed_files()
-    pdfs_to_process = [p for p in all_pdfs if p.name not in processed]
+    new_pdfs = [p for p in all_pdfs if p.name not in processed]
+    
+    total_new = len(new_pdfs)
+    logger.info(f"🚀 Processing {total_new} High Court PDFs (Total Found: {len(all_pdfs)})")
 
-    logger.info(f"📄 Total PDFs found: {len(all_pdfs)}")
-    logger.info(f"⏭️ Skipped (already processed): {len(processed)}")
-    logger.info(f"🚀 Processing new PDFs: {len(pdfs_to_process)}")
+    FILE_BATCH_SIZE = 20 
+    
+    with tqdm(total=total_new, desc="Processing HC PDFs") as pbar:
+        for i in range(0, total_new, FILE_BATCH_SIZE):
+            batch_files = new_pdfs[i : i + FILE_BATCH_SIZE]
+            current_filenames = [p.name for p in batch_files]
+            
+            chunk_buffer = []
 
-    if not pdfs_to_process:
-        logger.info("Nothing to process.")
-        return
+            # Step A: Parallel Parsing + Heuristics + Cleaning
+            with ProcessPoolExecutor(max_workers=CPU_WORKERS) as executor:
+                results = list(executor.map(extract_text_from_pdf, batch_files))
+                for res in results:
+                    if res: chunk_buffer.extend(res)
 
-    PDF_BATCH = 50
+            # Step B: Sequential Optimized Upload
+            if chunk_buffer:
+                batch_embed_and_upload(chunk_buffer)
+            
+            # Step C: Checkpoint
+            mark_files_as_processed(current_filenames)
+            pbar.update(len(batch_files))
 
-    with tqdm(total=len(pdfs_to_process), desc="High Court PDFs") as pbar:
-        for i in range(0, len(pdfs_to_process), PDF_BATCH):
-            batch = pdfs_to_process[i:i + PDF_BATCH]
-            filenames = [p.name for p in batch]
+    logger.info("✅ High Court processing complete.")
 
-            extracted_chunks = []
-
-            # 1. Parallel PDF Extraction (with Cleaning & Heuristics)
-            with ProcessPoolExecutor(max_workers=MAX_WORKERS_PDF) as executor:
-                for result in executor.map(extract_text_from_pdf, batch):
-                    extracted_chunks.extend(result)
-                    pbar.update(1)
-
-            # 2. Parallel Embedding & Upsert
-            for j in range(0, len(extracted_chunks), PINECONE_BATCH_SIZE):
-                process_batch_embeddings_and_upsert(
-                    extracted_chunks[j:j + PINECONE_BATCH_SIZE]
-                )
-
-            # 3. Mark batch as processed
-            mark_files_as_processed(filenames)
-
-    logger.info("✅ High Court ingestion complete.")
-
-# ------------------------------
-# Entry
-# ------------------------------
 if __name__ == "__main__":
     main()

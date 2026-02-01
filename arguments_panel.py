@@ -283,11 +283,16 @@ def _judge_control_logic(user_input: str, details: Dict) -> Dict:
     """
     
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(_get_model_name(), generation_config={"response_mime_type": "application/json"})
-        response = model.generate_content(prompt)
-        return json.loads(response.text)
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        model_name = _get_model_name()
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={"response_mime_type": "application/json"},
+        )
+        text = getattr(response, "text", "")
+        return json.loads(text) if text else {"action": "ALLOW", "message": ""}
     except Exception as e:
         print(f"Judge Error: {e}")
         return {"action": "ALLOW", "message": ""}
@@ -329,10 +334,11 @@ def _generate_final_judgment(details: Dict) -> str:
      {transcript}
      """
     
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(_get_model_name())
-    return model.generate_content(prompt).text
+    from google import genai
+    client = genai.Client(api_key=api_key)
+    model_name = _get_model_name()
+    resp = client.models.generate_content(model=model_name, contents=prompt)
+    return getattr(resp, "text", str(resp))
 
 # ---------------------------------------------------------
 # OPPOSING COUNSEL (AI LAWYER)
@@ -367,10 +373,11 @@ def _generate_opposing_counsel_reply(user_input: str, details: Dict) -> str:
         {user_input}
         """
     
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(_get_model_name())
-    return model.generate_content(prompt).text
+    from google import genai
+    client = genai.Client(api_key=api_key)
+    model_name = _get_model_name()
+    resp = client.models.generate_content(model=model_name, contents=prompt)
+    return getattr(resp, "text", str(resp))
 
 # ---------------------------------------------------------
 # UI RENDERER
