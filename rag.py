@@ -28,7 +28,7 @@ BARE_ACTS_INDEX_NAME = os.getenv("BARE_ACTS_INDEX_NAME", "legal-bare-acts-index"
 
 # 🛑 NAMESPACE FIX: Pointing both to 'high_court' because that's where your data is.
 NAMESPACE_SC = "high_court"     
-NAMESPACE_HC = "high_court"
+NAMESPACE_HC = "HC"
 
 # Model Config
 EMBEDDING_MODEL = "models/text-embedding-004"
