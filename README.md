@@ -1,6 +1,6 @@
 # iLegalLearn — AI Lawyer
 
-**iLegalLearn — AI Lawyer** is an AI-driven legal assistant designed for law students and legal professionals. It simplifies Indian legal research and learning by enabling intelligent search, understanding, and drafting using a curated corpus of Indian legal case PDFs (2004–2009).
+**iLegalLearn — AI Lawyer** is an AI-driven legal assistant designed for law students and legal practitioners. It simplifies Indian legal research and learning by enabling intelligent search, understanding, and drafting over a curated corpus of Indian legal case PDFs (2004–2009).
 
 ---
 
@@ -17,6 +17,7 @@
   - [Prerequisites](#prerequisites)
   - [Environment variables](#environment-variables)
   - [Run locally (backend / UI)](#run-locally-backend--ui)
+  - [RAG test CLI](#rag-test-cli)
 - [Folder Structure](#folder-structure)
 - [Use Cases](#use-cases)
 - [Future Scope](#future-scope)
@@ -54,9 +55,10 @@ iLegalLearn is a focused MVP that helps users explore, learn, and draft legal co
 
 ### 🤖 AI Capabilities
 - **PDF ingestion & preprocessing**: Extract text from PDFs, chunk, and index.
-- **Semantic search (LLM-based)**: Use embeddings + vector search to find relevant chunks.
+- **Semantic search (LLM-based)**: Use embeddings + vector search (Pinecone / FAISS) to find relevant chunks.
 - **Context-aware answers**: Retrieval-augmented generation (RAG) to ground LLM outputs in retrieved context.
 - **Legal language simplification**: Convert complex judgments and provisions into learner-friendly language.
+ - **Configurable embedding models**: Choose between `models/gemini-embedding-001` and `models/text-embedding-004` at runtime via the Streamlit sidebar.
 
 ## System Architecture (High-level)
 1. PDF ingestion
@@ -81,8 +83,10 @@ User → UI (Streamlit) → Backend (Python) → RAG → LLM → Response
 
 - Frontend / UI: **Streamlit** 
 - Backend: **Python** 
-- LLM Integration: **Google Generative AI (Gemini)** via `google-generativeai` or `langchain-google-genai`
-- Embeddings & Vector Search: **FAISS** shards are included in the repo for offline retrieval; the project also contains utilities to upload to Pinecone if required.
+- LLM Integration: **Google Generative AI (Gemini)** via `google-generativeai` (primary) and compatible tooling.
+- Embeddings & Vector Search:
+  - Primary: **Pinecone** index (e.g., `legal-judgments-index`) queried via `rag.py`.
+  - Optional: **FAISS** shards included in the repo for offline/local-only retrieval workflows.
 - Data store: Minimal file-based metadata and JSON; optionally **PostgreSQL** for production workloads.
 - Dataset: Indian legal case PDFs — ingested into FAISS shards during preprocessing.
 
@@ -90,7 +94,7 @@ User → UI (Streamlit) → Backend (Python) → RAG → LLM → Response
 Below are the instructions to run the project locally on Windows (PowerShell). Adjust for macOS / Linux accordingly.
 
 ### Prerequisites
-- Python 3.10+ (3.11 recommended)
+- Python 3.11 recommended
 - pip
 - (Optional) Virtual environment tool: `venv`, `conda`, etc.
 - Access to an LLM provider API key (Gemini / Google Generative API) if you want live LLM responses
@@ -116,6 +120,8 @@ pip install -r requirements.txt
 ```text
 GEMINI_API_KEY=<your_api_key>
 GEMINI_GEN_MODEL=<optional_custom_model_name>
+PINECONE_API_KEY=<your_pinecone_api_key>
+INDEX_NAME=legal-judgments-index
 ```
 
 > Note: For local testing you can leave `GEMINI_API_KEY` unset and rely on deterministic or mocked flows included in the repo.
@@ -129,6 +135,26 @@ streamlit run ai_lawyer/app.py
 
 Open the URL shown by Streamlit (usually `http://localhost:8501`).
 
+### RAG test CLI
+
+For quick, model-agnostic inspection of retrieval quality (without the UI), use the RAG test script:
+
+```powershell
+cd ai_lawyer
+python rag_test.py
+```
+
+You will be prompted for a natural-language legal query, and the script will print the top-k retrieved documents with scores and short excerpts. Advanced usage:
+
+```powershell
+python rag_test.py "Pratap Singh v. State of Jharkhand 2005" --top-k 5 --court both
+```
+
+`--court` controls namespace routing in Pinecone:
+- `scc`  – Supreme Court namespaces only
+- `hc`   – High Court-only namespace
+- `both` – All namespaces together (default)
+
 ## Folder Structure
 Below is a high-level map of the repository and responsibilities (based on current layout):
 
@@ -136,9 +162,11 @@ Below is a high-level map of the repository and responsibilities (based on curre
 ai_lawyer/
   ├─ app.py                 # Streamlit app (main UI + orchestration)
   ├─ understanding.py       # Intent/topic detection, clarifier logic
-  ├─ rag.py                 # Dummy RAG helpers, retrieval wrappers
+  ├─ rag.py                 # RAG helpers, Pinecone retrieval wrappers
+  ├─ rag_test.py            # CLI tool to test and debug RAG retrieval
   ├─ student_tools.py       # Student-oriented output helpers (PYQs, simplify, mock args)
   ├─ professional_tools.py  # Professional-oriented helpers (drafts, citation finder)
+  ├─ arguments_panel.py     # Professional arguments / moot-court helper UI
   ├─ upload_to_pinecone.py  # Utility to upload vectors to Pinecone (optional)
   ├─ faiss_shards/          # FAISS index shards used for local retrieval
   ├─ faiss_shards_hc/       # Court-specific or category-specific shards
