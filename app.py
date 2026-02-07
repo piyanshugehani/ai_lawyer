@@ -61,6 +61,14 @@ def _init_session():
     if "include_high_court" not in st.session_state:
         st.session_state["include_high_court"] = False
 
+    # Embedding model configuration for RAG (controls rag.EMBEDDING_MODEL)
+    if "embedding_model" not in st.session_state:
+        # Default to whatever the rag module is currently using
+        try:
+            st.session_state["embedding_model"] = getattr(rag, "EMBEDDING_MODEL", "models/gemini-embedding-001")
+        except Exception:
+            st.session_state["embedding_model"] = "models/gemini-embedding-001"
+
 def _update_memory(new_prefs: Dict[str, str]):
     if not new_prefs: return
     changes = []
@@ -92,6 +100,79 @@ def _extract_prefs_from_text(text: str) -> Dict[str, str]:
 # ---------------------------------------------------------
 # HELPER FUNCTIONS
 # ---------------------------------------------------------
+
+def _inject_global_styles() -> None:
+    """Inject a dark-mode-friendly, professional visual theme."""
+    st.markdown(
+        """
+        <style>
+            /* Constrain main width for a more app-like feel */
+            .block-container {
+                max-width: 1100px;
+                padding-top: 1.0rem;
+                padding-bottom: 1.8rem;
+            }
+
+            /* Top header branding – neutral so it works on dark/light */
+            .lc-header {
+                padding-bottom: 0.7rem;
+                margin-bottom: 0.5rem;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+            }
+            .lc-header-title {
+                font-size: 1.6rem;
+                font-weight: 700;
+                margin-bottom: 0.1rem;
+            }
+            .lc-header-subtitle {
+                font-size: 0.9rem;
+                opacity: 0.75;
+                margin: 0;
+            }
+
+            /* Compact status badges under the header */
+            .lc-status-row {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.4rem;
+                margin-top: 0.25rem;
+                margin-bottom: 0.4rem;
+            }
+            .lc-badge {
+                font-size: 0.75rem;
+                padding: 0.12rem 0.55rem;
+                border-radius: 999px;
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                backdrop-filter: blur(8px);
+            }
+
+            /* Chat message bubbles – tuned for dark mode */
+            div[data-testid="stChatMessage"] {
+                border-radius: 10px;
+                padding: 0.35rem 0.55rem;
+                margin-bottom: 0.35rem;
+                background: rgba(255, 255, 255, 0.02);
+                border: 1px solid rgba(255, 255, 255, 0.07);
+            }
+
+            /* Slight differentiation: last user vs assistant bubble alignment */
+            div[data-testid="stChatMessage"]:has(div[data-testid="stMarkdownContainer"] p:contains("👤 User")) {
+                text-align: left;
+            }
+
+            /* Footer */
+            .lc-footer {
+                font-size: 0.75rem;
+                opacity: 0.7;
+                border-top: 1px solid rgba(255, 255, 255, 0.12);
+                margin-top: 1.0rem;
+                padding-top: 0.55rem;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 def _get_gemini_api_key() -> Optional[str]:
     key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -134,7 +215,7 @@ def _format_recent_history(max_turns: int = 4) -> str:
 # UI COMPONENTS
 # ---------------------------------------------------------
 
-@st.dialog("Welcome to LexiCounsel ⚖️")
+@st.dialog("Welcome to LexiCounsel (India) ⚖️")
 def role_selection_popup():
     st.write("To customize your legal assistant, please select your profile:")
     col1, col2 = st.columns(2)
@@ -157,13 +238,13 @@ def _send_intro_message():
     if role == "student":
         msg = (
             f"**Hello! I'm LexiCounsel, your AI Study Companion ({jurisdiction}).** 🎓\n\n"
-            "I can help you with **PYQs**, **Case Summaries**, and **Mock Arguments**.\n"
+            "I can help you with **PYQs**, **Case Summaries**,**Section Simplified** and **Bare acts**.\n"
             "What are you studying today?"
         )
     else:
         msg = (
             f"**Greetings. I'm LexiCounsel, your Legal Research Assistant ({jurisdiction}).** ⚖️\n\n"
-            "I can assist with **Case Law**, **Drafting**, and **Citations**.\n"
+            "I can assist with **Case Law**, **Drafting**, **Mock Arguments** and **Citations**.\n"
             "How can I assist with your practice today?"
         )
             
@@ -205,12 +286,28 @@ def _generate_answer(query: str, role: str, intent: str, retrieved_docs: List[Di
     default_instr = "Style: IRAC." if role == "student" else "Style: Professional."
     override_instr = ""
     if not has_context:
-        # Strict guardrail: avoid conclusions when corpus provides no match
         override_instr = (
-            "No specific matches found in the available corpus. "
-            "Do not infer outcomes or procedural steps not present in the retrieved context. "
-            "If the user asks about post-judgment appeals or subsequent litigation, respond that the provided corpus does not mention such details, "
-            "and suggest narrowing timeframe, providing a citation, or uploading the relevant documents."
+            "No specific judgments from the internal corpus are available for this turn. "
+            "You may still answer using your general legal knowledge for the relevant jurisdiction, "
+            "but clearly state that the answer is based on general principles and not on a specific retrieved case. "
+            "Avoid fabricating case names, citations, or procedural histories. If the user needs authority, "
+            "invite them to provide a citation, timeframe, or upload the relevant documents."
+        )
+    else:
+        # When we DO have retrieved context, explicitly tell the model to
+        # ground its answer in that context where possible, but still allow
+        # fallback to its wider legal knowledge for well-known cases.
+        override_instr = (
+            "There IS retrieved context available for this turn. Base your answer "
+            "primarily on the [RETRIEVED CONTEXT] text. Do NOT say that there is "
+            "no specific retrieved document or that you cannot answer from the "
+            "retrieved documents. If the context is incomplete for the exact "
+            "question, still provide the best possible answer that is faithful "
+            "to the retrieved text, and mention that the corpus snippet may be partial. "
+            "If the user asks about a well-known case (by name and year) and the "
+            "retrieved snippets do not clearly contain that case, you may also use "
+            "your general legal knowledge of that case, clearly labelling those parts "
+            "as based on general legal understanding beyond the uploaded corpus."
         )
 
     prompt = f"""
@@ -234,22 +331,13 @@ def _generate_answer(query: str, role: str, intent: str, retrieved_docs: List[Di
     3. **Apply Style**: {prefs.get('style')} or {default_instr}.
     4. {override_instr}
     5. Prefer High Court judgments for procedural or registry-related questions (e.g. dismissal for default, office objections) when such context is available.
-     6. If case number, court, or year mismatch exists between the user's query and the retrieved context, you MUST refuse to answer and MUST NOT generalize from other cases; instead respond that the retrieved context does not match the specified case details.
+     6. Only when the user has provided a very specific case identity (such as an exact case number or neutral citation) and the retrieved context clearly does not match that identity, you MUST refuse to answer from the corpus and say that the retrieved context does not match those details. In all other situations, you may answer using a combination of retrieved snippets and your general legal knowledge, with clear labelling.
      7. Do NOT merge or conflate multiple different cases in a single answer when the user has specified a particular case identity.
      8. Do not reveal PDF names, filenames, paths, or internal source identifiers unless the user explicitly asks for sources.
-     9. If the retrieved context is empty or not clearly relevant, avoid speculating; ask for clarification or a narrower timeframe.
+     9. If the retrieved context is empty or clearly off-topic, avoid speculating; ask for clarification or a narrower timeframe. If there IS retrieved context, answer from it as faithfully as possible even if it does not spell out every detail of the user's question, and where necessary supplement with clearly-labelled general legal knowledge.
     
     [RESPONSE]
     """
-
-    # If there is no context, prefer a cautious, direct response to prevent hallucinations
-    if not has_context:
-        cautious = (
-            "Based on the currently available corpus, there is no mention of such details. "
-            "If you can share the specific citation or timeframe, I can check more precisely."
-        )
-        log_cli("🛡️ Guardrail", "Returned cautious response due to empty retrieval context.")
-        return cautious
 
     try:
         from google import genai
@@ -260,6 +348,39 @@ def _generate_answer(query: str, role: str, intent: str, retrieved_docs: List[Di
         return getattr(resp, "text", str(resp))
     except Exception as e:
         return f"⚠️ Error: {e}"
+
+
+def _format_citation_block(retrieved_docs: List[Dict[str, Any]]) -> str:
+    """Build a markdown citations block from retrieved documents.
+
+    This is appended AFTER the main answer so that the LLM
+    doesn't have to guess sources; we use the actual retrieved
+    context instead. Shown only when we have at least one doc.
+    """
+    if not retrieved_docs:
+        return ""
+
+    # lines: List[str] = []
+    # lines.append("\n\n---\n**Sources / Citations (retrieved)**\n")
+
+    # for idx, doc in enumerate(retrieved_docs, start=1):
+    #     # Prefer human-readable title, fall back to internal id
+    #     title = str(doc.get("title") or doc.get("doc_id") or "Unknown source").strip()
+    #     year = doc.get("year")
+    #     court = (doc.get("court") or doc.get("category") or "").strip()
+
+    #     meta_parts: List[str] = []
+    #     if court:
+    #         meta_parts.append(court)
+    #     if year:
+    #         meta_parts.append(str(year))
+
+    #     if meta_parts:
+    #         lines.append(f"{idx}. {title} ({', '.join(meta_parts)})")
+    #     else:
+    #         lines.append(f"{idx}. {title}")
+
+    # return "\n".join(lines)
 
 
 def _generate_legal_draft(query: str, history_text: str = "") -> str:
@@ -363,9 +484,56 @@ This document is AI-generated and must be reviewed by a qualified legal professi
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="⚖️", layout="centered")
     _init_session()
+    _inject_global_styles()
 
-    # Sidebar controls for retrieval behaviour
+    # Lightweight, consistent header
+    prefs = st.session_state.get("user_prefs", {})
+    role_label = st.session_state.get("role") or "Not selected"
+    jurisdiction_label = prefs.get("jurisdiction", "India")
+    style_label = prefs.get("style") or "Default style"
+
+    st.markdown(
+        f"""
+        <div class="lc-header">
+            <div class="lc-header-title"></div>
+            <p class="lc-header-subtitle">AI-assisted Indian legal research and drafting for students and professionals.</p>
+            <div class="lc-status-row">
+                <span class="lc-badge">Profile: {role_label.title() if isinstance(role_label, str) else role_label}</span>
+                <span class="lc-badge">Jurisdiction: {jurisdiction_label}</span>
+                <span class="lc-badge">Style: {style_label}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Sidebar controls for model & retrieval behaviour
     with st.sidebar:
+        st.markdown("### Model Settings")
+
+        # Map human-readable labels to actual embedding model IDs
+        embedding_options = {
+            "Gemini embedding (001)": "models/gemini-embedding-001",
+            "Text embedding (004)": "models/text-embedding-004",
+        }
+        current_model = st.session_state.get("embedding_model", getattr(rag, "EMBEDDING_MODEL", "models/gemini-embedding-001"))
+        # Find label corresponding to current model, default to first option
+        default_label = next(
+            (label for label, val in embedding_options.items() if val == current_model),
+            list(embedding_options.keys())[0],
+        )
+
+        selected_label = st.selectbox(
+            "Embedding model",
+            list(embedding_options.keys()),
+            index=list(embedding_options.keys()).index(default_label),
+            help=(
+                "Controls which Google Gemini embedding model is used when "
+                "generating vectors for Pinecone RAG queries."
+            ),
+        )
+        st.session_state["embedding_model"] = embedding_options[selected_label]
+
         st.markdown("### Corpus Settings")
         st.checkbox(
             "Include High Court cases (with Supreme Court)",
@@ -527,6 +695,13 @@ def main():
 
     # RAG
     with st.spinner("Analyzing..."):
+        # Ensure rag uses the embedding model selected in the UI
+        try:
+            rag.EMBEDDING_MODEL = st.session_state.get("embedding_model", rag.EMBEDDING_MODEL)
+            log_cli("🔧 RAG", f"Using embedding model: {rag.EMBEDDING_MODEL}")
+        except Exception:
+            pass
+
         include_hcc = st.session_state.get("include_high_court", False)
 
         # Parse case identity from the user query (case number, year, court)
@@ -647,7 +822,18 @@ def main():
                     f"{i}. file={d.get('doc_id')} year={d.get('year')} page={d.get('page')} "
                     f"score={round(d.get('score', 0), 3)} cat={d.get('category')}"
                 )
-        # --- Guardrail: corpus-limited disclaimer when weak/no context ---
+
+            # Aggregate retrieval confidence stats for CLI debugging
+            scores = [float(d.get("score") or 0.0) for d in retrieved_docs]
+            if scores:
+                top_score = max(scores)
+                min_score = min(scores)
+                avg_score = sum(scores) / len(scores)
+                log_cli(
+                    "📈 RetrievalStats",
+                    f"docs={len(retrieved_docs)} top={top_score:.3f} min={min_score:.3f} avg={avg_score:.3f}",
+                )
+        # --- Guardrail: corpus-limited disclaimer when clearly outside scope ---
         disclaimer = None
         # Detect whether we have any Bare Act context in the retrieved set.
         has_bare_acts = any(
@@ -661,18 +847,29 @@ def main():
         # decision years. Also skip such warnings when Bare Acts are present,
         # because bare-acts corpus is not limited to 2005–2006.
         is_identity_query = bool(case_identity.get("case_number") and case_identity.get("filing_year"))
+        intent_for_disclaimer = analysis.get("intent")
         if not is_identity_query and not has_bare_acts:
             # Known corpus window based on your ingestion of PDFs
             corpus_min, corpus_max = 2005, 2006
             query_year = year_min
-            if not retrieved_docs:
+
+            # Strong "no matching judgments" message should only be used
+            # when the user is explicitly asking for judgments/citations and
+            # we are clearly outside the corpus window.
+            wants_specific_judgments = intent_for_disclaimer in {"find_judgements", "citation_finder", "case_summaries"}
+
+            if not retrieved_docs and wants_specific_judgments and query_year and (
+                query_year < corpus_min or query_year > corpus_max
+            ):
                 disclaimer = (
-                    "⚠️ No matching judgments found in the current uploaded corpus. "
-                    "If you’re asking about events clearly outside the years covered "
-                    "by this corpus, please provide a narrower timeframe or upload "
-                    "the relevant documents."
+                    "⚠️ No matching judgments found in the current uploaded corpus for the year you mentioned. "
+                    "The judgments corpus mainly covers 2005–2006. Please narrow the timeframe, "
+                    "provide a different citation, or upload the relevant documents."
                 )
-            elif query_year and (query_year < corpus_min or query_year > corpus_max):
+            elif retrieved_docs and query_year and (
+                query_year < corpus_min or query_year > corpus_max
+            ):
+                # Softer warning when we do have some matches, but year looks outside window.
                 disclaimer = (
                     "⚠️ Your query mentions a year that may fall outside the primary "
                     "coverage of the current judgments corpus (2005–2006). Bare Acts "
@@ -736,9 +933,11 @@ def main():
                     return False
 
             return True
-        # If we have an explicit case identity (number or filing year), enforce
-        # a hard match; otherwise fall back to normal behaviour.
-        if case_identity.get("case_number") or case_identity.get("filing_year"):
+        # If we have a strong case identity (both number AND filing year), enforce
+        # a hard match; otherwise fall back to normal semantic retrieval.
+        # Using only a bare year or only a number is often too weak and can
+        # incorrectly discard valid retrieved context.
+        if case_identity.get("case_number") and case_identity.get("filing_year"):
             filtered_docs = [d for d in retrieved_docs if _doc_matches_identity(d, case_identity)]
             if not filtered_docs:
                 answer = "The retrieved context does not match the specified case details."
@@ -748,6 +947,11 @@ def main():
                 answer = _generate_answer(user_input, role, analysis["intent"], retrieved_docs)
         else:
             answer = _generate_answer(user_input, role, analysis["intent"], retrieved_docs)
+
+        # Append structured citations block based on actual retrieved docs
+        citation_block = _format_citation_block(retrieved_docs)
+        if citation_block:
+            answer = f"{answer}{citation_block}"
 
     st.session_state["messages"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
@@ -768,6 +972,16 @@ def main():
     if role == "professional" and tab_arguments is not None:
         with tab_arguments:
             arguments_panel.render_arguments_panel()
+
+    # Global footer for the prototype
+    st.markdown(
+        """
+        <div class="lc-footer">
+            LexiCounsel is currently a prototype for educational and research support and does not constitute legal advice. 
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":

@@ -26,12 +26,16 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 INDEX_NAME = "legal-judgments-index"
 BARE_ACTS_INDEX_NAME = os.getenv("BARE_ACTS_INDEX_NAME", "legal-bare-acts-index")
 
-# 🛑 NAMESPACE FIX: Pointing both to 'high_court' because that's where your data is.
-NAMESPACE_SC = "high_court"     
-NAMESPACE_HC = "HC"
+# Namespace configuration
+# Supreme Court PDFs live in two namespaces; High Court PDFs live in one.
+SC_NAMESPACES = ["supreme_court", "high_court"]
+HC_NAMESPACES = ["supreme_court", "high_court","HC"]
 
 # Model Config
-EMBEDDING_MODEL = "models/text-embedding-004"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+
+# Retrieval tuning
+MIN_SIMILARITY_SCORE = float(os.getenv("MIN_SIMILARITY_SCORE", "0.25"))
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -63,7 +67,7 @@ except Exception as e:
 # ---------------------------------------------------------
 
 def get_query_embedding(text: str) -> Optional[List[float]]:
-    """Generates embedding using text-embedding-004."""
+    """Generates an embedding using the currently configured EMBEDDING_MODEL."""
     try:
         # We wrap 'contents=[text]' to ensure correct SDK behavior
         response = client_genai.models.embed_content(
@@ -137,33 +141,75 @@ def search_chunks(
     # 2. Build Filter
     meta_filter = build_pinecone_filter(year_min, year_max, doc_id_like)
 
-    # 3. Determine Namespaces (Force both since data is messy)
-    target_namespaces = [NAMESPACE_SC, NAMESPACE_HC]
+    # 3. Determine Namespaces based on court routing
+    #    "scc"  -> only Supreme Court namespaces
+    #    "hc"   -> only High Court namespace
+    #    "both"/None/other -> all namespaces
+    court = (court or "both").lower()
+    if court == "scc":
+        target_namespaces = SC_NAMESPACES
+    elif court == "hc":
+        target_namespaces = HC_NAMESPACES
+    else:
+        target_namespaces = SC_NAMESPACES + HC_NAMESPACES
 
-    # 4. Query Pinecone
+    # 4. Query Pinecone (with safe fallbacks)
     all_matches = []
     for ns in target_namespaces:
         try:
+            # First attempt: with metadata filters (year / filename) if any
             results = index_judgments.query(
                 vector=vector,
                 namespace=ns,
                 top_k=top_k,
                 include_metadata=True,
-                filter=meta_filter if meta_filter else None
+                filter=meta_filter if meta_filter else None,
             )
-            for match in results.matches:
+            ns_matches = list(results.matches or [])
+
+            # If filters were applied and nothing came back, retry once without filters
+            if meta_filter and not ns_matches:
+                logger.info(
+                    "RAG: namespace=%s had no matches with filter=%s, retrying without filter",
+                    ns,
+                    meta_filter,
+                )
+                results = index_judgments.query(
+                    vector=vector,
+                    namespace=ns,
+                    top_k=top_k,
+                    include_metadata=True,
+                    filter=None,
+                )
+                ns_matches = list(results.matches or [])
+
+            for match in ns_matches:
                 all_matches.append((ns, match))
-        except Exception:
+        except Exception as e:
+            logger.error(f"RAG query failed for namespace={ns}: {e}")
             continue
 
     if not all_matches:
+        logger.info("RAG: No matches from Pinecone across any namespace (even without filters).")
         return []
+
+    # Basic debug stats for raw matches before any score filtering
+    raw_scores = [m.score or 0.0 for _, m in all_matches]
+    if raw_scores:
+        logger.info(
+            "RAG raw matches: count=%d top=%.3f min=%.3f avg=%.3f threshold=%.3f",
+            len(raw_scores),
+            max(raw_scores),
+            min(raw_scores),
+            sum(raw_scores) / len(raw_scores),
+            MIN_SIMILARITY_SCORE,
+        )
 
     # 5. Sort by Score (optionally give a tiny boost to High Court)
     def _sort_key(item):
         ns, match = item
         score = match.score or 0.0
-        if prefer_high_court and ns == NAMESPACE_HC:
+        if prefer_high_court and ns in HC_NAMESPACES:
             score += 0.05
         return score
 
@@ -172,39 +218,87 @@ def search_chunks(
     # 6. Format Output
     enriched_results: List[Dict[str, Any]] = []
     seen_ids = set()
+    below_threshold_count = 0
 
     for ns, match in all_matches:
         md = match.metadata or {}
         doc_id = md.get("filename", "Unknown")
-        
+
         # Deduplication (optional)
         if doc_id in seen_ids and len(enriched_results) > 0:
-            continue 
+            continue
         seen_ids.add(doc_id)
 
         text_content = md.get("text", "")
 
+        # Drop very low-similarity chunks so we don't hallucinate
+        score_val = match.score or 0.0
+        if score_val < MIN_SIMILARITY_SCORE:
+            below_threshold_count += 1
+            continue
+
         # Optional keyword filter at chunk level
-        if keyword_must_contain:
-            if keyword_must_contain.lower() not in text_content.lower():
-                continue
+        if keyword_must_contain and keyword_must_contain.lower() not in text_content.lower():
+            continue
 
         enriched_results.append({
             "doc_id": doc_id,
             "source_path": doc_id,
             "chunk_index": int(md.get("chunk_index", 0)),
-            "score": match.score,
-            "title": f"{doc_id} (Page {md.get('page')})",
+            "score": score_val,
+            "title": doc_id,
             "year": int(md.get("year", 0)),
-            "category": "High Court" if ns == NAMESPACE_HC else "Supreme Court",
+            "category": "High Court" if ns in HC_NAMESPACES else "Supreme Court",
             "court": md.get("court", ns),
             "page": int(md.get("page", 0)),
             "summary": text_content,
             "text": text_content,
         })
-        
+
         if len(enriched_results) >= top_k:
             break
+
+    # If Pinecone returned matches but all were under the similarity threshold,
+    # fall back to the best top_k matches instead of returning an empty list.
+    if not enriched_results and all_matches:
+        logger.warning(
+            "RAG: %d matches were below similarity threshold %.3f; "
+            "falling back to unfiltered top_k results.",
+            below_threshold_count,
+            MIN_SIMILARITY_SCORE,
+        )
+
+        enriched_results = []
+        seen_ids.clear()
+        for ns, match in all_matches:
+            md = match.metadata or {}
+            doc_id = md.get("filename", "Unknown")
+
+            if doc_id in seen_ids and len(enriched_results) > 0:
+                continue
+            seen_ids.add(doc_id)
+
+            text_content = md.get("text", "")
+
+            if keyword_must_contain and keyword_must_contain.lower() not in text_content.lower():
+                continue
+
+            enriched_results.append({
+                "doc_id": doc_id,
+                "source_path": doc_id,
+                "chunk_index": int(md.get("chunk_index", 0)),
+                "score": match.score or 0.0,
+                "title": doc_id,
+                "year": int(md.get("year", 0)),
+                "category": "High Court" if ns in HC_NAMESPACES else "Supreme Court",
+                "court": md.get("court", ns),
+                "page": int(md.get("page", 0)),
+                "summary": text_content,
+                "text": text_content,
+            })
+
+            if len(enriched_results) >= top_k:
+                break
 
     return enriched_results
 
@@ -262,7 +356,7 @@ def search_bare_acts(
 
     return enriched
 
-def retrieve(query: str, k: int = 3) -> List[Dict[str, Any]]:
+def retrieve(query: str, k: int = 5) -> List[Dict[str, Any]]:
     return search_chunks(query, top_k=k)
 
 # ---------------------------------------------------------
